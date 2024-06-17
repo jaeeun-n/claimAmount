@@ -1,0 +1,316 @@
+---
+title: CODING CHALLENGE – DATA SCIENTIST
+author: Jae-Eun Nam
+date: 2024-06-17
+output:
+  pdf_document:
+     citation_package: natbib
+     number_sections: true
+bibliography: bibliography.bib
+biblio-style: myabbrvnat
+link-citations: yes
+linkcolor: blue
+header-includes:
+  - \usepackage{caption}
+  - \usepackage{float}
+  - \captionsetup{labelformat=empty}
+  - \usepackage{multirow}
+  - \usepackage{graphicx}
+  - \usepackage{booktabs}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r message = FALSE, warning = FALSE}
+library(farff) # read arff file
+library(tidyverse)
+
+library(ggplot2)
+library(ggcorrplot)
+library(gridExtra)
+
+library(mlr3verse)
+library(mlr3extralearners)
+
+library(caret) # cross-validation for tweedie glm
+library(tweedie)
+library(statmod)
+```
+
+# Aufgabe
+
+Unter https://www.openml.org/d/41214 und https://www.openml.org/d/41215 finden Sie zwei Datensätze eines französischen Automobilversicherers. Diese beinhalten Risikomerkmale und Schadeninformationen zu Kraftfahrt-Haftpflicht-Versicherungsverträgen (eine Datensatzbeschreibung finden Sie am Ende dieses Textes). Ihre Aufgabe besteht in der Modellierung der zu erwartenden Schadenhöhe pro Versicherungsnehmer und Jahr anhand der Risikomerkmale der Kunden. Dieser Wert ist Basis für die Berechnung eines fairen Versicherungsbeitrags.
+
+# Datensätze 
+
+## freMTPL2freq
+\begin{table}[!htbp]
+\centering
+\begin{tabular}{ll} 
+\hline
+\textbf{Variable} & \textbf{Beschreibung}\\ 
+\hline
+\verb |IDpol| & ID des Vertrags \\
+\verb |Exposure| & Länge des Versicherungszeitraums (in Jahren)   \\
+\verb |BonusMalus| & Schadenfreiheitsrabatt \\
+\verb |ClaimNb| & Anzahl Schäden im Versicherungszeitraum \\
+
+\verb |DrivAge| & Alter des Versicherungsnehmers \\
+\verb |Area| & Area-Code des Versicherungsnehmers \\
+\verb |Region| & Region des Versicherungsnehmers \\
+\verb |Density| & Anzahl der Einwohner pro km2 im Wohnort des Versicherungsnehmers \\
+
+\verb |VehBrand| & Marke des versicherten Kfz \\
+\verb |VehGas| & Antrieb des versicherten Kfz \\
+\verb |VehPower| & Leistung des versicherten Kfz \\
+\verb |VehAge| & Alter des versicherten Kfz \\
+
+\hline
+\end{tabular}
+\end{table}
+
+## freMTPL2freq
+\begin{table}[!htbp]
+\centering
+\begin{tabular}{ll} 
+\hline
+\textbf{Variable} & \textbf{Beschreibung} \\ 
+\hline
+\verb |IDpol| & ID des Vertrags \\
+\verb |ClaimAmount| & Höhe der einzelnen Schadenaufwände \\ 
+      & (mehrere Einträge pro Vertrag, falls im Zeitraum mehrere Schäden vorhanden waren.)  \\
+\hline
+\end{tabular}
+\end{table}
+
+
+\newpage
+# Datenaufbereitung
+```{r preprocessing, echo=TRUE}
+### Data Preprocessing
+
+# read datasets
+freMTPL2freq = readARFF('freMTPL2freq.arff')
+freMTPL2sev = readARFF('freMTPL2sev.arff')
+
+str(freMTPL2freq) # 678013 contracts
+str(freMTPL2sev) # 26639 claims
+
+# sum claim amounts that belongs to same contract
+groupedFreMTPL2sev = freMTPL2sev %>%
+  group_by(IDpol) %>%
+  summarize(TotalClaimAmount = sum(ClaimAmount)) 
+
+# join data by 'IDpol'
+tmpDf = left_join(freMTPL2freq, groupedFreMTPL2sev, by = 'IDpol')
+
+# contracts without matching observation in freMTPL2sev 
+# should have claim amount of 0
+tmpDf = tmpDf %>% 
+  mutate(TotalClaimAmount = replace_na(TotalClaimAmount, 0)) 
+
+# however some claims are listed in freMTPL2freq, but not in freMTPL2sev
+# remove these 9116 cases (need to check, if reasonable)
+# 668897 from 678013 observations left
+tmpDf = tmpDf %>% 
+  filter(!(ClaimNb > 0 & TotalClaimAmount == 0)) 
+
+# select relevant data
+df = tmpDf %>%
+  mutate(VehGas = factor(VehGas),
+         ClaimAmountPerYear = TotalClaimAmount / Exposure) %>%
+  select(!c(IDpol, ClaimNb, Exposure, TotalClaimAmount))
+str(df)
+```
+
+\newpage
+# Deskriptive Analyse
+## Univariate Analyse
+```{r univariate, echo=FALSE}
+### explorative analysis
+# univariate analysis
+summary(df)
+theme_set(theme_minimal())
+theme_update(text = element_text(size = 6))
+
+dfWithout0claim = df %>%
+  filter(ClaimAmountPerYear > 0)
+print('5-number summary for ClaimAmountPerYear after excluding 0-valued observations:')
+fivenum(dfWithout0claim$ClaimAmountPerYear)
+```
+
+### Kategoriale Variablen
+```{r uniBar, echo=FALSE}
+barArea = ggplot(dfWithout0claim, aes(x = Area)) +
+  geom_bar() 
+barVehBrand = ggplot(dfWithout0claim, aes(x = VehBrand)) +
+  geom_bar() 
+barGas = ggplot(dfWithout0claim, aes(x = VehGas)) +
+  geom_bar() 
+barRegion = ggplot(dfWithout0claim, aes(x = Region)) +
+  geom_bar()
+
+grid.arrange(barArea, barVehBrand, barGas, barRegion)
+```
+
+### Numerische Variablen
+```{r uniBox, echo=FALSE}
+boxClaimAmountPerYear = ggplot(dfWithout0claim, aes(x = ClaimAmountPerYear)) +
+  geom_boxplot() 
+boxClaimAmountPerYear
+
+boxVehPower = ggplot(dfWithout0claim, aes(x = VehPower, alpha = 0.1)) +
+  geom_boxplot()  
+boxVehAge = ggplot(dfWithout0claim, aes(x = VehAge, alpha = 0.1)) +
+  geom_boxplot()  
+boxDrivAge = ggplot(dfWithout0claim, aes(x = DrivAge, alpha = 0.1)) +
+  geom_boxplot() 
+boxBonusMalus = ggplot(dfWithout0claim, aes(x = BonusMalus, alpha = 0.1)) +
+  geom_boxplot() 
+boxDensity = ggplot(dfWithout0claim, aes(x = Density, alpha = 0.1)) +
+  geom_boxplot() 
+
+grid.arrange(boxVehPower, boxVehAge, boxDrivAge, boxBonusMalus, boxDensity)
+```
+
+\newpage
+## Bivariate Analyse
+### Kategoriale Variablen
+```{r biBox, echo=FALSE}
+# bivariate analysis
+# grouped boxplots
+boxArea = ggplot(dfWithout0claim, aes(x = Area, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_boxplot() 
+boxVehBrand = ggplot(dfWithout0claim, aes(x = VehBrand, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_boxplot() 
+boxGas = ggplot(dfWithout0claim, aes(x = VehGas, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_boxplot() 
+boxRegion = ggplot(dfWithout0claim, aes(x = Region, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_boxplot() +
+  theme(text = element_text(size = 6))
+
+grid.arrange(boxArea, boxVehBrand, boxGas, boxRegion, ncol = 1)
+```
+
+\newpage
+### Numerische Variablen
+```{r biScatter, echo=FALSE}
+# scatterplots
+scatterVehPower = ggplot(dfWithout0claim, aes(x = VehPower, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_point()
+scatterVehAge = ggplot(dfWithout0claim, aes(x = VehAge, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_point() 
+scatterDrivAge = ggplot(dfWithout0claim, aes(x = DrivAge, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_point() 
+scatterBonusMalus = ggplot(dfWithout0claim, aes(x = BonusMalus, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_point()
+scatterDensity = ggplot(dfWithout0claim, aes(x = Density, y = ClaimAmountPerYear, alpha = 0.1)) +
+  geom_point() 
+
+grid.arrange(scatterVehPower, scatterVehAge, scatterDrivAge, scatterBonusMalus,
+             scatterDensity, ncol = 1)
+```
+
+### Korrelation zwischen numerischen Variablen
+```{r correlation}
+# correlations
+dfNum = df %>%
+  select(ClaimAmountPerYear, VehPower, VehPower, DrivAge, BonusMalus, Density)
+correlations = cor(dfNum)
+ggcorrplot(correlations, type = "lower", legend.title = "Correlation", show.diag = TRUE, 
+           lab = TRUE)
+```
+
+\newpage
+# Modellierung
+```{r mlr3, include=FALSE}
+### modeling using mlr3 package
+# define task
+taskClaim = as_task_regr(df, target = 'ClaimAmountPerYear', id = 'freMTPL2')
+taskClaim
+splits = mlr3::partition(taskClaim, ratio = 0.6)
+
+# modeling specificaiton
+measure = msr('regr.mse')
+```
+
+## Random Forest
+```{r randomForest, message=FALSE, echo=TRUE}
+## random forest
+learnerRf = lrn('regr.ranger', predict_type = 'response')
+learnerRf$train(taskClaim, row_ids = splits$train)
+print(learnerRf$model)
+```
+
+## Xgboost
+```{r catboost, echo=TRUE}
+fencoder = po("encode", method = "treatment", affect_columns = selector_type("factor"))
+learnerXgboost = lrn('regr.xgboost', predict_type = 'response')
+learnerXgboost = as_learner(fencoder %>>% learnerXgboost)
+learnerXgboost$train(taskClaim, row_ids = splits$train)
+print(learnerXgboost$model$regr.xgboost$model)
+```
+
+## Tweedie GLM
+```{r glm, echo=TRUE}
+## Tweedie-GLM
+trainDf = df[splits$train, ]
+testDf = df[splits$test, ]
+trainedGlm = glm(ClaimAmountPerYear ~ ., data = trainDf, family = tweedie(1.1))
+summary(trainedGlm)
+```
+
+\newpage
+# Modellvergleich
+```{r benchmark, message=FALSE}
+### benchmark models
+# random forest, xgboost
+testMeasures = msrs(c('regr.rmse', 'regr.rsq'))
+
+trainPrediction = learnerRf$predict(taskClaim, row_ids = splits$train)
+testPrediction = learnerRf$predict(taskClaim, row_ids = splits$test)
+print('Random Forest evaluated on train set:')
+trainPrediction$score(testMeasures)
+print('Random Forest evaluated on test set:')
+testPrediction$score(testMeasures)
+
+trainPrediction = learnerXgboost$predict(taskClaim, row_ids = splits$train)
+testPrediction = learnerXgboost$predict(taskClaim, row_ids = splits$test)
+print('XGboost evaluated on train set:')
+trainPrediction$score(testMeasures)
+print('XGboost Forest evaluated on test set:')
+testPrediction$score(testMeasures)
+
+# glm
+trainPrediction = predict(trainedGlm, newdata = trainDf, type = "response")
+testPrediction = predict(trainedGlm, newdata = testDf, type = "response")
+trainRmse = mean((trainDf$ClaimAmountPerYear - trainPrediction)^2) %>% sqrt()
+testRmse = mean((testDf$ClaimAmountPerYear - testPrediction)^2) %>% sqrt()
+print('GLM evaluated on train set, RMSE:')
+trainRmse
+print('GLM evaluated on test set, RMSE:')
+testRmse
+```
+
+\newpage
+# Feature Importance
+```{r featureImportance, echo=FALSE}
+print('Variablen geordnet nach der absoluten Größe der Koeffizienten:')
+trainedGlm$coefficients[order(abs(trainedGlm$coefficients), decreasing = TRUE)]
+```
+
+# Fazit
+\begin{itemize}
+  \item Schadenaufwände sind nicht-negative Daten mit vielen Nullen.
+  \item Tweedie Verteilung ist geeignet für die Modellierung von Schadenaufwänden.
+  \item Von den drei Modellen (Random Forest, XGboost, GLM) hatte GLM das beste Ergebnis.
+  \item Einzelne Regionen und Area scheinen, einen größeren Zusammenhang mit der Schadenhöhe zu haben.
+\end{itemize}
+
+# Verbesserungsvorschläge
+\begin{itemize}
+  \item Hyperparameter Tuning (insb. zur Vermeidung von Overfitting)
+  \item Methoden für Imbalenced Data, z.B. Oversampling, Weighting
+\end{itemize}
